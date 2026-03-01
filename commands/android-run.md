@@ -1,15 +1,44 @@
 ---
-allowed-tools: Bash(find:*), Bash(./gradlew*:*), Bash(JAVA_HOME*:*), Bash(adb*:*), Bash(ls:*), Bash(echo:*), Bash(cat:*), Bash(grep:*), Bash(java:*), Bash(uname:*), Bash(~/AppData/Local/Android/Sdk/emulator/emulator.exe*:*), Bash(~/Library/Android/sdk/emulator/emulator*:*), Bash(~/Android/Sdk/emulator/emulator*:*)
-description: Build, install, and launch the debug app on the Android emulator
+allowed-tools: Bash(find:*), Bash(./gradlew*:*), Bash(JAVA_HOME*:*), Bash(adb*:*), Bash(ls:*), Bash(echo:*), Bash(cat:*), Bash(grep:*), Bash(java:*), Bash(uname:*), Bash(~/AppData/Local/Android/Sdk/emulator/emulator.exe*:*), Bash(~/Library/Android/sdk/emulator/emulator*:*), Bash(~/Android/Sdk/emulator/emulator*:*), Bash(ANDROID_SERIAL*:*)
+description: Build, install, and launch the debug app — auto-targets a connected physical device if present, otherwise the emulator. Override with `/android-run device` or `/android-run emulator`.
 ---
 
 ## Android Run
 
-Build the app, install it on the Android emulator, and launch it — all in one step.
+Build the app, install it, and launch it — all in one step.
+
+Targets are selected automatically or overridden by argument:
+
+| Invocation | Behaviour |
+|---|---|
+| `/android-run` | Auto-detect: physical device if connected, otherwise emulator |
+| `/android-run emulator` | Force emulator regardless of connected devices |
+| `/android-run device` | Force physical device (stop if none connected) |
 
 ---
 
-### Step 0 — Detect OS and validate Java environment
+### Step 0a — Read target mode
+
+Inspect the argument passed to this command (the text after `/android-run`):
+
+- Argument is `device` → set `TARGET_MODE=device`
+- Argument is `emulator` → set `TARGET_MODE=emulator`
+- No argument (or anything else) → set `TARGET_MODE=auto`
+
+**If `TARGET_MODE=auto`**, run `adb devices` immediately and inspect the output:
+
+```
+adb devices
+```
+
+- If any non-`emulator-` line ends with `device` (i.e. a physical device in `device` state) → set `TARGET_MODE=device`, store that device's serial as `DEVICE_SERIAL`.
+- Otherwise → set `TARGET_MODE=emulator`.
+
+Report the resolved mode: e.g. "Target mode: device (auto-detected, serial: R5CNA12345)" or "Target mode: emulator".
+
+---
+
+### Step 0b — Detect OS and validate Java environment
 
 **Detect the operating system — run this first, on its own:**
 ```
@@ -75,7 +104,9 @@ If no `gradlew` is found, report: "No Android project found (gradlew not in curr
 
 ### Step 2a — Locate the Android emulator binary
 
-Using `EMULATOR_NAME` and `SDK_DEFAULT` from Step 0, try these in order:
+**Skip this step entirely if `TARGET_MODE=device`.**
+
+If `TARGET_MODE=emulator`, using `EMULATOR_NAME` and `SDK_DEFAULT` from Step 0b, try these in order:
 
 **1. Check environment variables:**
 ```
@@ -119,9 +150,10 @@ Do **not** attempt to derive the main activity class name from the manifest — 
 
 ---
 
-### Step 3 — Check if emulator is running; discover AVD
+### Step 3 — Device readiness check
 
-**Check for a running emulator:**
+#### If `TARGET_MODE=emulator`:
+
 ```
 adb devices
 ```
@@ -136,9 +168,25 @@ If any line starts with `emulator-` → an emulator is already running. Skip to 
 - **One AVD** → use it automatically.
 - **Multiple AVDs** → prefer the one with the highest API number (sort names descending). Report: "Starting AVD: `<name>` (`<n>` AVDs available — run `/android-run` again to use a different one if needed)."
 
+#### If `TARGET_MODE=device`:
+
+```
+adb devices
+```
+
+Inspect the output for non-`emulator-` lines in `device` state:
+
+- **One physical device** → store its serial as `DEVICE_SERIAL`. Report: "Physical device ready: `<DEVICE_SERIAL>`." Skip to Step 5.
+- **Zero physical devices** → report: "No physical device detected. Connect your Android device via USB and ensure USB debugging is enabled in Developer Options." **Stop.**
+- **Multiple physical devices** → list each serial and model. Ask the user: "Multiple devices connected — which serial should be used?" Store the answer as `DEVICE_SERIAL`.
+
 ---
 
 ### Step 4 — Start the emulator (if not running)
+
+**Skip this step entirely if `TARGET_MODE=device`.**
+
+If `TARGET_MODE=emulator` and no emulator was found running in Step 3:
 
 ```
 "$EMULATOR_BIN" -avd <avd-name> -no-snapshot-load &
@@ -158,7 +206,9 @@ If the command hangs for more than 120 s, report: "Emulator boot timed out. Chec
 
 ### Step 5 — Build and install
 
-If a `JAVA_HOME` was derived in Step 0, prefix it on the command (this matches the `Bash(JAVA_HOME*:*)` allowed-tools entry so no confirmation prompt is shown):
+#### If `TARGET_MODE=emulator`:
+
+If a `JAVA_HOME` was derived in Step 0b, prefix it on the command:
 
 ```
 JAVA_HOME="<derived-path>" ./gradlew installDebug 2>&1
@@ -170,6 +220,26 @@ If Java was already in PATH, run without the prefix:
 ./gradlew installDebug 2>&1
 ```
 
+#### If `TARGET_MODE=device`:
+
+Use `ANDROID_SERIAL` to target the specific device (honoured by both Gradle and ADB, and avoids ambiguity when an emulator is also connected):
+
+If a `JAVA_HOME` was derived in Step 0b:
+
+```
+ANDROID_SERIAL=<DEVICE_SERIAL> JAVA_HOME="<derived-path>" ./gradlew installDebug 2>&1
+```
+
+If Java was already in PATH:
+
+```
+ANDROID_SERIAL=<DEVICE_SERIAL> ./gradlew installDebug 2>&1
+```
+
+---
+
+**After either path:**
+
 `installDebug` compiles and installs in a single step (requires a connected device, which is now ready).
 
 - **`BUILD SUCCESSFUL`** → continue.
@@ -179,21 +249,38 @@ If Java was already in PATH, run without the prefix:
 
 ### Step 6 — Launch the app
 
-Use `monkey` to launch the app's launcher activity. This always works regardless of whether the source package differs from the `applicationId`:
+Use `monkey` to launch the app's launcher activity. This always works regardless of whether the source package differs from the `applicationId`.
+
+#### If `TARGET_MODE=emulator`:
 
 ```
-adb shell monkey -p <packageName> -c android.intent.category.LAUNCHER 1
+adb shell monkey -p <PACKAGE_NAME> -c android.intent.category.LAUNCHER 1
 ```
 
-This tells the system to fire the LAUNCHER intent for the package, so no activity class name is needed.
+#### If `TARGET_MODE=device`:
+
+```
+adb -s <DEVICE_SERIAL> shell monkey -p <PACKAGE_NAME> -c android.intent.category.LAUNCHER 1
+```
 
 ---
 
 ### Step 7 — Confirm launch
 
+#### If `TARGET_MODE=emulator`:
+
 ```
-adb shell pidof <packageName>
+adb shell pidof <PACKAGE_NAME>
 ```
 
 - **PID returned** → report: "App is running on the emulator."
 - **No PID** → report: "Launch command sent but app process not detected — check the emulator screen for errors or crash dialogs."
+
+#### If `TARGET_MODE=device`:
+
+```
+adb -s <DEVICE_SERIAL> shell pidof <PACKAGE_NAME>
+```
+
+- **PID returned** → report: "App is running on device `<DEVICE_SERIAL>`."
+- **No PID** → report: "Launch command sent but app process not detected — check the device screen for errors or crash dialogs."
