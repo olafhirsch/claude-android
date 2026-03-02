@@ -123,6 +123,8 @@ object CircularFileLogger {
     @Volatile private var enabled = false
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     private val lock = Any()
+    private var lastMsg = ""      // "L/Tag: msg" without timestamp — for dedup
+    private var lastMsgCount = 0  // how many times lastMsg has been seen consecutively
 
     fun init(context: Context, isEnabled: Boolean = true) {
         enabled = isEnabled
@@ -159,9 +161,23 @@ object CircularFileLogger {
     private fun write(level: String, tag: String, msg: String) {
         if (!enabled) return
         val dir = logDir ?: return
-        val line = "${dateFormat.format(Date())} $level/$tag: $msg\n"
+        val content = "$level/$tag: $msg"
+        val timestamp = dateFormat.format(Date())
         synchronized(lock) {
             try {
+                if (content == lastMsg) {
+                    lastMsgCount++
+                    return
+                }
+                // Flush dedup summary for the previous run, then write the new line
+                val toWrite = buildString {
+                    if (lastMsgCount > 1) {
+                        append("$timestamp $lastMsg [×$lastMsgCount total]\n")
+                    }
+                    append("$timestamp $content\n")
+                }
+                lastMsg = content
+                lastMsgCount = 1
                 val fileA = File(dir, FILE_A)
                 val target = if (fileA.length() < MAX_FILE_SIZE) {
                     fileA
@@ -170,7 +186,7 @@ object CircularFileLogger {
                     fileA.renameTo(File(dir, FILE_B))
                     File(dir, FILE_A)
                 }
-                PrintWriter(FileWriter(target, true)).use { it.print(line) }
+                PrintWriter(FileWriter(target, true)).use { it.print(toWrite) }
             } catch (e: Exception) {
                 Log.e(TAG, "CircularFileLogger write failed", e)
             }

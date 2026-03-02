@@ -32,7 +32,7 @@ yyyy-MM-dd HH:mm:ss.SSS L/Tag: message
 where `L` is the priority letter (D/I/W/E).
 
 Feed the full content through the same triage / strategic analysis pipeline (Steps 4–5 below), with these adjustments:
-- Tell Haiku in the prompt: "Lines are in `yyyy-MM-dd HH:mm:ss.SSS L/Tag: message` format. The log may span multiple app sessions — session boundaries are marked by lines containing `=== App started`."
+- Tell Haiku in the prompt: "Lines are in `yyyy-MM-dd HH:mm:ss.SSS L/Tag: message` format. The log may span multiple app sessions — session boundaries are marked by lines containing `=== App started`. Lines ending with `[×N total]` are deduplication summaries — the preceding line was repeated N times total (including the first occurrence); treat them as a single logical event when counting errors or warnings."
 - Skip any live-logcat-specific instructions (no PID filter, no `adb` follow-up commands).
 - After analysis, offer: "To capture a fresh live log from a connected device, re-run `/android-logcat` without a file argument."
 
