@@ -79,7 +79,7 @@ Found:
   Util package:      <UTIL_PACKAGE_PATH>
   Settings fragment: <SETTINGS_FRAGMENT_PATH or "not found">
   FileProvider:      <"already exists" or "will create new">
-  Existing Log. calls: <LOG_CALL_COUNT> (all captured automatically once logger is wired in)
+  Existing Log. calls: <LOG_CALL_COUNT> (captured transparently via background logcat reader — no call-site changes needed)
 
 Will implement:
   1. CircularFileLogger.kt → <UTIL_PACKAGE_PATH>/CircularFileLogger.kt
@@ -103,7 +103,12 @@ Read the Application class file to extract the exact `KOTLIN_PACKAGE`. Place the
 ```kotlin
 package <KOTLIN_PACKAGE>.util
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
+import android.provider.Settings
 import android.util.Log
 import java.io.File
 import java.io.FileWriter
@@ -114,38 +119,32 @@ import java.util.Locale
 
 object CircularFileLogger {
     private const val TAG = "CircularFileLogger"
-    private const val MAX_FILE_SIZE = 512 * 1024L // 512 KB per file (~5 000 lines)
+    private const val MAX_FILE_SIZE = 512 * 1024L
     private const val LOG_DIR = "logs"
     private const val FILE_A = "app_log_1.txt"
     private const val FILE_B = "app_log_2.txt"
 
     @Volatile private var logDir: File? = null
     @Volatile private var enabled = false
+    @Volatile private var readerThread: Thread? = null
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     private val lock = Any()
-    private var lastMsg = ""      // "L/Tag: msg" without timestamp — for dedup
-    private var lastMsgCount = 0  // how many times lastMsg has been seen consecutively
+    private var lastMsg = ""
+    private var lastMsgCount = 0
 
     fun init(context: Context, isEnabled: Boolean = true) {
         enabled = isEnabled
         logDir = File(context.getExternalFilesDir(null), LOG_DIR).also { it.mkdirs() }
-        i(TAG, "=== App started (CircularFileLogger enabled=$isEnabled) ===")
+        if (!isEnabled) return
+        if (!isAdbConnected(context)) startReader()
+        registerUsbReceiver(context.applicationContext)
     }
 
     fun setEnabled(isEnabled: Boolean) {
         enabled = isEnabled
-        i(TAG, "File logging enabled=$isEnabled")
+        if (!isEnabled) stopReader()
     }
 
-    fun d(tag: String, msg: String) = write("D", tag, msg)
-    fun i(tag: String, msg: String) = write("I", tag, msg)
-    fun w(tag: String, msg: String) = write("W", tag, msg)
-    fun e(tag: String, msg: String, throwable: Throwable? = null) {
-        write("E", tag, msg)
-        throwable?.let { write("E", tag, Log.getStackTraceString(it)) }
-    }
-
-    /** The two log files in chronological order (older first). Excludes non-existent files. */
     fun logFiles(): List<File> {
         val dir = logDir ?: return emptyList()
         return listOfNotNull(
@@ -154,38 +153,77 @@ object CircularFileLogger {
         )
     }
 
-    /** Combined log content (B + A) as a single string, for sharing. */
     fun combinedLog(): String =
         logFiles().joinToString(separator = "") { it.readText() }
 
-    private fun write(level: String, tag: String, msg: String) {
-        if (!enabled) return
+    // ── Internal ────────────────────────────────────────────────────────────
+
+    private fun isAdbConnected(context: Context): Boolean {
+        val adbEnabled = Settings.Global.getInt(
+            context.contentResolver, Settings.Global.ADB_ENABLED, 0
+        ) != 0
+        val battery = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val plugged = battery?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
+        return adbEnabled && plugged == BatteryManager.BATTERY_PLUGGED_USB
+    }
+
+    private fun startReader() {
+        if (readerThread?.isAlive == true) return
+        readerThread = Thread {
+            try {
+                val pid = android.os.Process.myPid()
+                val process = Runtime.getRuntime().exec(
+                    arrayOf("logcat", "--pid=$pid", "-v", "tag", "-T", "500")
+                )
+                writeRaw("=== File logging started ===")
+                process.inputStream.bufferedReader().use { reader ->
+                    var line: String?
+                    while (reader.readLine().also { line = it } != null) {
+                        if (!enabled) break
+                        line?.let { writeRaw(it) }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "CircularFileLogger reader failed", e)
+            }
+        }.also { it.isDaemon = true; it.start() }
+    }
+
+    private fun stopReader() {
+        readerThread?.interrupt()
+        readerThread = null
+    }
+
+    private fun registerUsbReceiver(context: Context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                if (!enabled) return
+                val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+                val usbPlugged = plugged == BatteryManager.BATTERY_PLUGGED_USB
+                val adbEnabled = Settings.Global.getInt(
+                    ctx.contentResolver, Settings.Global.ADB_ENABLED, 0
+                ) != 0
+                if (adbEnabled && usbPlugged) stopReader() else startReader()
+            }
+        }
+        context.registerReceiver(receiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+    }
+
+    private fun writeRaw(rawLine: String) {
         val dir = logDir ?: return
-        val content = "$level/$tag: $msg"
         val timestamp = dateFormat.format(Date())
         synchronized(lock) {
             try {
-                if (content == lastMsg) {
-                    lastMsgCount++
-                    return
-                }
-                // Flush dedup summary for the previous run, then write the new line
+                if (rawLine == lastMsg) { lastMsgCount++; return }
                 val toWrite = buildString {
-                    if (lastMsgCount > 1) {
-                        append("$timestamp $lastMsg [×$lastMsgCount total]\n")
-                    }
-                    append("$timestamp $content\n")
+                    if (lastMsgCount > 1) append("$timestamp $lastMsg [×$lastMsgCount total]\n")
+                    append("$timestamp $rawLine\n")
                 }
-                lastMsg = content
+                lastMsg = rawLine
                 lastMsgCount = 1
                 val fileA = File(dir, FILE_A)
-                val target = if (fileA.length() < MAX_FILE_SIZE) {
-                    fileA
-                } else {
-                    File(dir, FILE_B).delete()
-                    fileA.renameTo(File(dir, FILE_B))
-                    File(dir, FILE_A)
-                }
+                val target = if (fileA.length() < MAX_FILE_SIZE) fileA
+                else { File(dir, FILE_B).delete(); fileA.renameTo(File(dir, FILE_B)); File(dir, FILE_A) }
                 PrintWriter(FileWriter(target, true)).use { it.print(toWrite) }
             } catch (e: Exception) {
                 Log.e(TAG, "CircularFileLogger write failed", e)
@@ -203,7 +241,7 @@ Read `<APPLICATION_CLASS_PATH>`. Add `override fun onCreate()` with the logger i
 ```kotlin
 override fun onCreate() {
     super.onCreate()
-    CircularFileLogger.init(this, isEnabled = true)
+    CircularFileLogger.init(this)
 }
 ```
 
@@ -218,6 +256,8 @@ override fun onCreate() {
 
 Add the required import: `import <KOTLIN_PACKAGE>.util.CircularFileLogger`
 (For settings mode also add: `import android.content.Context`)
+
+No other imports are needed at any call site — all existing `Log.*` calls are captured transparently by the background logcat reader.
 
 If `onCreate()` already exists, add the call inside it after `super.onCreate()`.
 
