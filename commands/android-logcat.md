@@ -1,15 +1,46 @@
 ---
-allowed-tools: Bash(adb*:*), Bash(find:*), Bash(grep:*)
-description: Capture and analyze Android logcat output from the running app — works with emulator or physical device
+allowed-tools: Bash(adb*:*), Bash(find:*), Bash(grep:*), Read
+description: Capture and analyze Android logcat output from the running app — works with emulator or physical device. Accepts an optional local log file path for offline analysis.
 ---
 
 ## Android Logcat
 
 Capture a snapshot of the running app's logcat output, condense it, and analyze it.
+Also supports offline analysis of a log file shared from the device (e.g. via the "Share debug log" button).
 
 ---
 
-### Step 0 — Detect connected device
+### Step 0 — Determine mode
+
+Read the argument passed to this command (if any):
+
+- **Argument looks like a file path** (starts with `/`, `./`, `~`, or ends with `.txt`/`.log`) → set `MODE=file`, store the path as `LOG_FILE_PATH`. Skip Steps 1–3 and go directly to Step 4.
+- **No argument** → set `MODE=live`. Continue with Step 1 (existing live logcat flow).
+
+---
+
+### Step 0b — File mode: read and triage
+
+*(Only executed when `MODE=file`)*
+
+Read the file at `LOG_FILE_PATH` using the Read tool (or Bash `cat` if it is very large).
+
+The file format produced by `CircularFileLogger` is:
+```
+yyyy-MM-dd HH:mm:ss.SSS L/Tag: message
+```
+where `L` is the priority letter (D/I/W/E).
+
+Feed the full content through the same triage / strategic analysis pipeline (Steps 4–5 below), with these adjustments:
+- Tell Haiku in the prompt: "Lines are in `yyyy-MM-dd HH:mm:ss.SSS L/Tag: message` format. The log may span multiple app sessions — session boundaries are marked by lines containing `=== App started`."
+- Skip any live-logcat-specific instructions (no PID filter, no `adb` follow-up commands).
+- After analysis, offer: "To capture a fresh live log from a connected device, re-run `/android-logcat` without a file argument."
+
+Then **stop** — do not proceed to Steps 1–3.
+
+---
+
+### Step 1 — Detect connected device
 
 ```
 adb devices
